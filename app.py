@@ -1,34 +1,76 @@
+# -*- coding: utf-8 -*-
+"""截图工具（界面层）—— 启动方式：python text.py
+
+这个文件只管界面：画控件、收输入、把结果写进日志区。
+真正的活都在同目录的几个模块里 —— 改行为改那边，改外观改这里：
+
+    screenshot_backend.py   截图本体：mss 抓帧 + 存成 PNG
+    screenshot_core.py      纯逻辑：保存路径规则、文件名规则、坐标解析
+    screenshot_utils.py     图像工具：读模板图、抓整屏帧
+
+四种用法：
+    1. 手填坐标 → 「截图」按钮
+    2. 「全屏」按钮（或坐标留空）→ 截整个屏幕
+    3. 「拾取区域」→ 在屏幕上拖一个矩形，坐标自动填回输入框
+    4. 「模板匹配」→ 拿一张小图去屏幕上找它在哪，打印匹配分数（调试用）
+
+⚠️ 窗口高度（geometry 里的 590）是照着实际内容量出来的。
+   往里加控件前先确认总高还放得下，否则最底下的日志区和状态栏会被裁掉。
+"""
+
 import os
+import subprocess
 import sys
 import tkinter as tk
-from fileinput import close
-from tkinter import ttk, filedialog, messagebox
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
+
+import cv2
 
 # 保证能导入同目录下的 screenshot_backend 模块
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from screenshot_backend import transform_pos, capture_region
+from screenshot_backend import capture_region, transform_pos
+
+# 复用同目录下的逻辑层与图像工具层：保存路径规则、模板读取、抓帧都在那边。
+# 这里只做界面 —— 避免同一份代码在两处各养一个副本（改一处还得记得改另一处）。
+import screenshot_core as core
+import screenshot_utils as utils
 
 
 class ScreenshotApp:
+    """截图工具主窗口。
+
+    界面从上到下分 6 行：截图区域 / 保存设置 / 操作按钮 / 模板匹配 / 日志 / 状态栏。
+    窗口尺寸在 __init__ 里定死（不可缩放），所以每加一块控件都要回头确认还装得下。
+    """
+
     def __init__(self, root: tk.Tk):
+        """建根窗口 → 准备状态变量 → 搭界面 → 首次刷新尺寸提示 → 居中。
+
+        顺序有讲究：先有状态变量，_build_ui() 里的 Entry 才绑得上；
+        _update_size() 要排在 _build_ui() 之后，它依赖界面已经建好。
+        """
         self.root = root
         self.root.title("截图工具")
-
+        self.root.geometry("340x590")
         self.root.resizable(False, False)
 
         # ---------- 状态变量 ----------
-        self.var_x1 = tk.StringVar(value="1200")
-        self.var_y1 = tk.StringVar(value="878")
-        self.var_x2 = tk.StringVar(value="1270")
-        self.var_y2 = tk.StringVar(value="949")
-        self.var_path = tk.StringVar(
-            value=os.path.join("screenshots", "board.png")
-        )
+        self.var_x1 = tk.StringVar(value="")
+        self.var_y1 = tk.StringVar(value="")
+        self.var_x2 = tk.StringVar(value="")
+        self.var_y2 = tk.StringVar(value="")
+        # 保存设置：目录和文件名分开填，截图时才拼成完整路径
+        self.var_dir = tk.StringVar(value=os.path.join(_HERE, "screenshots"))
+        # 记住「上一次自动生成的文件名」：用户手改过就不再自动覆盖他的输入
+        self._auto_name = core.generate_default_filename()
+        self.var_name = tk.StringVar(value=self._auto_name)
         self.var_size = tk.StringVar(value="区域尺寸：--")
         self.var_status = tk.StringVar(value="就绪")
+        self.var_topmost = tk.BooleanVar(value=False)
 
         # 坐标变化时实时刷新尺寸提示
         for v in (self.var_x1, self.var_y1, self.var_x2, self.var_y2):
@@ -38,382 +80,515 @@ class ScreenshotApp:
         self._update_size()
         self._center()
 
+    # ================= 界面构建 =================
     def _build_ui(self):
-        """界面构建"""
+        """搭出整窗界面（纵向 6 行，布局见类 docstring）。
 
-        # 主框架
+        行号是手写的，往中间插新区块时要连带改掉后面所有区块的 row 值。
+        """
         pad = dict(padx=6, pady=4)
-        main = ttk.Frame(self.root, padding=12)
-        main.grid(row=0, column=0, sticky="nsew")
+        main_w = ttk.Frame(self.root, padding=12)
+        main_w.grid(row=0, column=0)
 
-        # ============= 截图区域 ==============================================
-        area = ttk.LabelFrame(main, text="截图区域（屏幕坐标）", padding=10)
+        # ---------- 截图区域 ----------
+        area = ttk.LabelFrame(main_w, text="截图区域（屏幕坐标 / 像素）", padding=10)
         area.grid(row=0, column=0, sticky="ew")
 
-        # 坐标填写区域
+        # 坐标输入框统一校验：最多 4 位数字（0–9999），可清空
+        coord_vcmd = (self.root.register(self._validate_coord), "%P")
+
+        def coord_entry(var):
+            """造一个坐标输入框：固定宽度、输入校验、绑好对应变量。"""
+            return ttk.Entry(
+                area, textvariable=var, width=5,
+                validate="key", validatecommand=coord_vcmd,
+            )
+
+        # 四个框按「左上 X1 → Y1 → 右下 X2 → Y2」串成一条链，给方向键跳转用
+        e_x1, e_y1 = coord_entry(self.var_x1), coord_entry(self.var_y1)
+        e_x2, e_y2 = coord_entry(self.var_x2), coord_entry(self.var_y2)
+
         ttk.Label(area, text="左上角  X1").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(area, textvariable=self.var_x1, width=9).grid(row=0, column=1, **pad)
+        e_x1.grid(row=0, column=1, **pad)
         ttk.Label(area, text="Y1").grid(row=0, column=2, sticky="e", **pad)
-        ttk.Entry(area, textvariable=self.var_y1, width=9).grid(row=0, column=3, **pad)
+        e_y1.grid(row=0, column=3, **pad)
 
         ttk.Label(area, text="右下角  X2").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(area, textvariable=self.var_x2, width=9).grid(row=1, column=1, **pad)
+        e_x2.grid(row=1, column=1, **pad)
         ttk.Label(area, text="Y2").grid(row=1, column=2, sticky="e", **pad)
-        ttk.Entry(area, textvariable=self.var_y2, width=9).grid(row=1, column=3, **pad)
+        e_y2.grid(row=1, column=3, **pad)
 
-        # 右侧  "拾取区域" "全屏"
+        self._bind_coord_navigation((e_x1, e_y1, e_x2, e_y2))
+
         btns = ttk.Frame(area)
-        btns.grid(row=0, column=4, rowspan=2, padx=(12, 0))
-        ttk.Button(btns, text="拾取区域", command=self._pick_region, width=10).grid(row=0, column=0, pady=2)
-        ttk.Button(btns, text="全屏", command=self._fill_screen, width=10).grid(row=1, column=0, pady=2)
+        btns.grid(row=0, column=4, rowspan=2, padx=(6, 0))
+        ttk.Button(btns, text="拾取区域", command=self._pick_region, width=8).grid(
+            row=0, column=0, pady=2
+        )
+        ttk.Button(btns, text="全屏", command=self._fill_screen, width=8).grid(
+            row=1, column=0, pady=2
+        )
 
-        # 字典格式坐标显示
-        ttk.Label(
-            area, textvariable=self.var_size, foreground="#555555"
-        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        # ---------- 尺寸提示 ----------
+        # 用「容器 + 关闭尺寸传播」把提示框住：
+        # 容器宽度交给 grid 按列宽分配（sticky="ew"），自己不参与宽度计算，
+        # 所以 var_size 文本再长，也只在容器内部被裁掉，
+        # 不会往上撑宽列宽 → area → main_w，整体布局与窗口尺寸保持不动。
+        size_wrap = ttk.Frame(area)
+        size_wrap.grid(row=2, column=0, columnspan=5, sticky="ew", padx=6, pady=(8, 0))
 
-        # =================================================================
+        size_lbl = ttk.Label(
+            size_wrap, textvariable=self.var_size, foreground="#555555", anchor="w"
+        )
+        size_lbl.pack(fill="both", expand=True)
 
-        # ============== 保存路径 ==========================================
-        pathbox = ttk.LabelFrame(main, text="保存路径", padding=10)
+        # 先量出单行文字需要的高度，再把容器高度钉死、关掉传播
+        size_wrap.update_idletasks()
+        size_wrap.configure(height=size_lbl.winfo_reqheight())
+        size_wrap.pack_propagate(False)   # 容器内用的是 pack，必须关 pack 的传播
+
+        # ---------- 保存设置 ----------
+        # 目录和文件名各占一行：标签在左、控件在右，比上下堆叠省一半高度。
+        # column 1 必须给 weight，Entry 才会跟着窗口横向拉伸。
+        pathbox = ttk.LabelFrame(main_w, text="保存", padding=10)
         pathbox.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        pathbox.columnconfigure(0, weight=1)
+        pathbox.columnconfigure(1, weight=1)
 
-        # 路径输入框
-        ttk.Entry(pathbox, textvariable=self.var_path).grid(
+        ttk.Label(pathbox, text="保存目录").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Entry(pathbox, textvariable=self.var_dir).grid(
+            row=0, column=1, sticky="ew", padx=6, pady=(0, 4)
+        )
+        ttk.Button(pathbox, text="选择目录", command=self._choose_dir, width=8).grid(
+            row=0, column=2, pady=(0, 4)
+        )
+
+        ttk.Label(pathbox, text="文件名").grid(row=1, column=0, sticky="w")
+        ttk.Entry(pathbox, textvariable=self.var_name).grid(
+            row=1, column=1, sticky="ew", padx=6
+        )
+        ttk.Label(pathbox, text="默认 .png", foreground="#888888").grid(
+            row=1, column=2, sticky="w"
+        )
+
+        # ---------- 操作按钮 ----------
+        actions = ttk.Frame(main_w)
+        actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+
+
+        ttk.Button(actions, text="截  图", command=self._on_capture, width=16).grid(
+            row=0, column=0, sticky="w", ipady=4, padx=(10, 6)
+        )
+        ttk.Button(actions, text="打开目录", command=self._open_output_dir, width=9).grid(
+            row=0, column=1, padx=3
+        )
+        ttk.Button(actions, text="清空日志", command=self._clear_log, width=9).grid(
+            row=0, column=2, padx=3
+        )
+
+        # ---------- 模板匹配 ----------
+        tplbox = ttk.LabelFrame(main_w, text="模板匹配", padding=10)
+        tplbox.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        tplbox.columnconfigure(0, weight=1)
+
+        self.var_template = tk.StringVar(
+            value=os.path.join(_HERE, "image", "game_ui_snapshots", "auto_disable.png")
+        )
+        ttk.Entry(tplbox, textvariable=self.var_template).grid(
             row=0, column=0, sticky="ew", padx=(0, 6)
         )
-
-        # 浏览路径按钮
-        ttk.Button(pathbox, text="浏览", command=self._browse, width=8).grid(row=0, column=1)
-        # ==================================================================
-
-        # --------------------- 操作按钮 -----------------------------------
-        actions = ttk.Frame(main)
-        actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        actions.columnconfigure(0, weight=1)
-
-        ttk.Button(actions, text="截 图",command=self._on_capture).grid(
-            row=0, column=0, sticky="ew",
+        ttk.Button(tplbox, text="选择模板", command=self._choose_template, width=8).grid(
+            row=0, column=1
         )
-        ttk.Button(actions, text="清空日志",command=self._clear_log).grid(
-            row=0, column=1, padx=(6, 0)
+        ttk.Button(tplbox, text="查看匹配分数", command=self._check_match).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0)
         )
 
-        # ------------------------------------------------------------------
-
-        # ------------- 日志 ------------------------------------------------
-        logbox = ttk.LabelFrame(main, text="日志", padding=6)
-        logbox.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        # ---------- 日志 ----------
+        logbox = ttk.LabelFrame(main_w, text="日志", padding=6)
+        logbox.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
         logbox.columnconfigure(0, weight=1)
 
-        # 文本框
         self.txt_log = tk.Text(
-            logbox, height=7, width=54, state="disabled", wrap="word"
+            logbox, height=7, width=38, state="disabled", wrap="word"
         )
         self.txt_log.grid(row=0, column=0, sticky="nsew")
 
-        # 滚动条
-        sb = ttk.Scrollbar(logbox, orient="vertical",command=self.txt_log.yview)
+        sb = ttk.Scrollbar(logbox, orient="vertical", command=self.txt_log.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        # 状态标签
-        ttk.Label(
-            main, textvariable=self.var_status, foreground="#0a7a4a"
-        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        # 状态栏和「窗口置顶」挤同一行 —— 底下的空间已经用满，没地方再开一行了
+        status_row = ttk.Frame(main_w)
+        status_row.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        status_row.columnconfigure(0, weight=1)
 
-    # ========== 内部工具 ==================
+        ttk.Label(
+            status_row, textvariable=self.var_status, foreground="#0a7a4a"
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(
+            status_row, text="窗口置顶", variable=self.var_topmost,
+            command=self._toggle_topmost,
+        ).grid(row=0, column=1, sticky="e")
+
+    # ================= 内部工具 =================
     def _center(self):
-        """把主窗口摆到屏幕水平居中、垂直偏上（上方留 1/3）的位置。"""
+        """把窗口摆到屏幕偏上的位置：水平居中，垂直大约在上三分之一处。"""
         self.root.update_idletasks()
         w, h = self.root.winfo_width(), self.root.winfo_height()
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         self.root.geometry(f"+{(sw - w) // 2}+{max((sh - h) // 3, 0)}")
 
-    # ================ 日志状态更新 ================
     def _log(self, msg: str):
-        """向只读日志框追加一行文本。
-
-            Text 处于 disabled 状态时程序也无法写入，因此这里先临时切到
-            normal 写入，再切回 disabled 保持只读。
-
-            参数：
-                msg: 要追加的日志内容，无需自带换行（函数会自动补 "\\n"）
-
-            返回：
-                无
-        """
+        """往日志区写一行，行首带时间戳（方便对照每次操作发生的时刻）。"""
+        stamp = datetime.now().strftime("[%H:%M:%S]")
         self.txt_log.configure(state="normal")
-        self.txt_log.insert("end", msg + "\n")
+        self.txt_log.insert("end", f"{stamp} {msg}\n")
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
 
     def _clear_log(self):
-        """清空只读日志框的全部内容。"""
+        """清空日志区。
+
+        Text 平时是 disabled（防止用户误敲），所以改内容前后要自己开关一遍。
+        """
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
 
-    # -----------区域尺寸标签--------------
-    def _read_coords(self):
-        """读取并校验四个坐标输入框。
+    def _toggle_topmost(self):
+        """切换窗口置顶（截图时常用：把工具钉在最前面，免得被别的窗口盖住）。"""
+        try:
+            self.root.attributes("-topmost", self.var_topmost.get())
+            self._log(f"窗口置顶已{'开启' if self.var_topmost.get() else '关闭'}")
+        except tk.TclError as exc:
+            self._log(f"✗ 置顶设置失败：{exc}")
 
-        从 var_x1/var_y1/var_x2/var_y2 取值，去掉首尾空格后转成整数。
-        允许输入小数，会朝零截断（如 "3.9" -> 3）。
+    def _validate_coord(self, proposed: str) -> bool:
+        """Entry 输入校验：允许清空，或最多 4 位半角数字（0–9999）。
 
-        返回:
-            tuple[int, int, int, int]: (x1, y1, x2, y2)
-
-        异常:
-            ValueError: 任一输入为空或不是数字时抛出。
+        返回 False 时 Tk 直接拒绝这次输入（键盘输入和粘贴都拦）。
+        注意：本函数绝不能抛异常，否则 Tk 会永久关闭该控件的校验。
         """
-        return (
-            int(float(self.var_x1.get().strip())),
-            int(float(self.var_y1.get().strip())),
-            int(float(self.var_x2.get().strip())),
-            int(float(self.var_y2.get().strip())),
+        return proposed == "" or (
+            proposed.isascii() and proposed.isdigit() and len(proposed) <= 4
         )
+
+    def _bind_coord_navigation(self, entries):
+        """让方向键能在四个坐标框之间跳。
+
+        - ↓ / ↑：直接跳下一个 / 上一个（单行输入框里上下键本来就没别的用途）
+        - → / ←：只有光标已在末尾 / 开头时才跳，否则留给它正常移动光标 ——
+          不这样做的话，填完 1234 想按 ← 退回去改一位都做不到
+        首尾相接成一个环。
+
+        :param entries: 按跳转顺序排好的输入框 (X1, Y1, X2, Y2)
+        """
+        count = len(entries)
+
+        def jump(index):
+            """焦点跳到第 index 个框（越界就绕回来），并全选内容方便直接覆盖。"""
+            target = entries[index % count]
+            target.focus_set()
+            target.selection_range(0, "end")
+            return "break"          # 返回 break 才会吃掉这次按键的默认行为
+
+        for i, entry in enumerate(entries):
+            entry.bind("<Down>", lambda _e, i=i: jump(i + 1))
+            entry.bind("<Up>", lambda _e, i=i: jump(i - 1))
+            entry.bind("<Right>", lambda e, i=i: jump(i + 1)
+                       if int(e.widget.index("insert")) >= len(e.widget.get()) else None)
+            entry.bind("<Left>", lambda e, i=i: jump(i - 1)
+                       if int(e.widget.index("insert")) <= 0 else None)
+
+    def _read_coords(self, allow_empty=False):
+        """读取并校验坐标。
+
+        - allow_empty=False：任意一项为空 → ValueError（提交时用）
+        - allow_empty=True ：任意一项为空 → 返回 None（实时预览用）
+
+        合法时返回 (x1, y1, x2, y2)，否则抛 ValueError。
+        """
+        vars_ = (self.var_x1, self.var_y1, self.var_x2, self.var_y2)
+        raw = [v.get().strip() for v in vars_]
+
+        if any(s == "" for s in raw):
+            if allow_empty:
+                return None
+            raise ValueError("坐标不能为空")
+
+        try:
+            return tuple(int(float(s)) for s in raw)
+        except (ValueError, OverflowError):   # inf / nan 抛的是 OverflowError
+            raise ValueError("坐标需为数字") from None
 
     def _update_size(self):
-        """实时显示 region 的宽高（复用后端的 transform_pos）"""
+        """实时显示 region 的宽高（复用后端的 transform_pos）。"""
         try:
-            x1, y1, x2, y2 = self._read_coords()
-        except ValueError:
-            self.var_size.set("区域尺寸：-- （坐标需为数字）")
+            coords = self._read_coords(allow_empty=True)
+        except ValueError as e:
+            self.var_size.set(f"区域：-- （{e}）")
             return
+
+        if coords is None:
+            self.var_size.set("区域：-- （请输入坐标）")
+            return
+
+        x1, y1, x2, y2 = coords
         region = transform_pos(x1, y1, x2, y2)
         self.var_size.set(
-            f"区域尺寸：{region['width']} × {region['height']} px"
-            f"　(left={region['left']}, top={region['top']})"
+            f"区域：{region['width']}×{region['height']} px "
+            f"(left={region['left']}, top={region['top']})"
         )
 
-    # ---------------------------------------------------------
+    # ================= 事件处理 =================
+    def _choose_dir(self):
+        """选择保存目录（只改目录，文件名那边不动）。"""
+        current = os.path.expanduser(self.var_dir.get().strip())
+        init_dir = current if os.path.isdir(current) else _HERE
+        chosen = filedialog.askdirectory(title="选择保存目录", initialdir=init_dir)
+        if chosen:
+            self.var_dir.set(chosen)
 
-    # ============== 事件处理 ===========================
-    def _browse(self):
-        """打开系统“另存为”对话框，让用户选择保存路径。
-
-            对话框的初始目录/文件名优先取自 var_path 当前值：
-                - 非空：拆成 dirname + basename 作为 initialdir / initialfile
-                - 为空：回退到脚本所在目录 _HERE + "screenshot.png"
-
-            用户确认后把选中的路径写回 var_path；取消则不做任何改动。
-            注意：本方法只负责“选路径”，不负责真正创建或保存文件。
-
-            :return: None
-        """
-        current = self.var_path.get().strip()
-        if current:
-            init_dir = os.path.dirname(os.path.abspath(current))
-            init_file = os.path.basename(current)
-        else:
-            init_dir, init_file = _HERE, "screenshot.png"
-
-        path = filedialog.asksaveasfilename(
-            title="选择保存位置",
-            defaultextension=".png",
-            filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")],
-            initialdir=init_dir,
-            initialfile=init_file,
+    def _choose_template(self):
+        """选择模板图片。"""
+        path = filedialog.askopenfilename(
+            title="选择模板图片",
+            initialdir=_HERE,
+            filetypes=[("图片文件", "*.png *.jpg *.jpeg *.bmp"), ("所有文件", "*.*")],
         )
         if path:
-            self.var_path.set(path)
+            self.var_template.set(path)
+
+    def _check_match(self):
+        """算模板在「全屏」和「当前坐标区域」里的最高匹配分（诊断用）。"""
+        tpl_path = self.var_template.get().strip()
+        if not tpl_path:
+            messagebox.showerror("模板未指定", "请先选择或填写模板路径。")
+            return
+
+        try:
+            tpl = utils._load_template(tpl_path)
+        except Exception as exc:                      # noqa: BLE001
+            self._log(f"✗ 模板加载失败：{exc}")
+            messagebox.showerror("模板加载失败", str(exc))
+            return
+
+        try:
+            # 抓一帧再转灰度：模板本身是灰度图，两边通道数必须一致
+            frame_bgr, _monitor = utils.grab_screen()
+            frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+            # ① 全屏匹配
+            result = cv2.matchTemplate(frame, tpl, cv2.TM_CCOEFF_NORMED)
+            _, best, _, loc = cv2.minMaxLoc(result)
+            self._log(f"全屏最高分：{best:.3f} @ {loc}")
+
+            # ② 区域匹配：复用上面的坐标输入框，全空就跳过
+            try:
+                coords = self._read_coords(allow_empty=True)
+            except ValueError as e:
+                coords = None
+                self._log(f"坐标无效，跳过区域内匹配（{e}）")
+
+            if coords is None:
+                self._log("未指定区域坐标，跳过区域内匹配")
+            else:
+                region = transform_pos(*coords)       # 顺序填反了也能归一化
+                if region["width"] <= 0 or region["height"] <= 0:
+                    raise ValueError("区域宽高必须大于 0。")
+                left, top = region["left"], region["top"]
+                sub = frame[top:top + region["height"], left:left + region["width"]]
+                if sub.size == 0:
+                    raise ValueError("指定区域超出屏幕范围或为空。")
+
+                result2 = cv2.matchTemplate(sub, tpl, cv2.TM_CCOEFF_NORMED)
+                _, best2, _, loc2 = cv2.minMaxLoc(result2)
+                self._log(f"区域最高分：{best2:.3f} → 绝对位置 "
+                          f"({loc2[0] + left}, {loc2[1] + top})")
+                self._log(f"阈值 0.8：{'通过' if best2 >= 0.8 else '不通过'}"
+                          f"　阈值 0.7：{'通过' if best2 >= 0.7 else '不通过'}")
+
+            self.var_status.set(f"匹配完成：{os.path.basename(tpl_path)}")
+        except Exception as exc:                      # noqa: BLE001
+            self.var_status.set("匹配失败")
+            self._log(f"✗ 匹配失败：{exc}")
+            messagebox.showerror("匹配失败", str(exc))
+
+    def _open_output_dir(self):
+        """在文件管理器里打开保存目录，方便查看刚存下的图。"""
+        path = os.path.expanduser(self.var_dir.get().strip())
+        if not path:
+            messagebox.showerror("参数错误", "保存目录为空，请先填写或选择。")
+            return
+        if not os.path.isdir(path):
+            messagebox.showerror("目录不存在", f"找不到这个目录：\n{path}")
+            return
+        try:
+            os.startfile(path)                      # Windows：叫起资源管理器
+        except AttributeError:                      # 非 Windows 的兜底
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen([opener, path])
+        except OSError as exc:
+            messagebox.showerror("打开失败", str(exc))
+
+    def _advance_auto_name(self):
+        """截图成功后推进自动文件名（用户手输过的名字不动）。"""
+        if core.should_advance_auto_name(self.var_name.get(), self._auto_name):
+            self._auto_name = core.generate_default_filename()
+            self.var_name.set(self._auto_name)
 
     def _fill_screen(self):
-        """将截图区域设为全屏范围。
-
-            把 var_x1/var_y1 置为 "0"，var_x2/var_y2 置为屏幕分辨率，
-            从而让区域覆盖整块主屏。设置后由 trace_add 触发 _update_size
-            自动刷新尺寸提示。
-
-            :return: None
-        """
+        """「全屏」按钮：把四个坐标填成整块屏幕（0,0 → 屏幕宽,屏幕高）。"""
         self.var_x1.set("0")
         self.var_y1.set("0")
         self.var_x2.set(str(self.root.winfo_screenwidth()))
         self.var_y2.set(str(self.root.winfo_screenheight()))
 
     def _on_capture(self):
-        """处理截图按钮的点击事件。
+        """「截图」按钮：校验输入 → 拼保存路径 → 调后端抓图 → 反馈结果。
 
-            依次完成：读取并校验坐标输入、校验保存路径、更新状态提示、
-            调用 capture_region 执行截图并保存，最后根据结果显示成功或失败信息。
-            任一环节出错都会通过 messagebox 弹窗提示并提前返回，同时把结果写入日志。
-
-            :return: None
+        界面层是错误处理的最后一站，所以这里不往上抛异常：
+        每一步失败都弹一句人话，并把细节写进日志区。
         """
         # 1) 参数校验
         try:
             x1, y1, x2, y2 = self._read_coords()
-        except ValueError:
-            messagebox.showerror("参数错误", "坐标必须是数字。")
+        except ValueError as e:
+            messagebox.showerror("参数错误", str(e))
             return
 
-        path = self.var_path.get().strip()
-        if not path:
-            messagebox.showerror("参数错误", "请填写保存路径。")
+        # 2) 拼出保存路径（目录 + 文件名；文件名留空则自动命名）
+        try:
+            path = core.build_output_path(
+                self.var_dir.get(), self.var_name.get(), self._auto_name
+            )
+        except ValueError as e:
+            messagebox.showerror("参数错误", str(e))
             return
 
-        self.var_status.set("正在截图...")
+        # 3) 调用后端
+        self.var_status.set("正在截图…")
         self.root.update_idletasks()
 
-        # 2) 调用后端
         try:
             saved = capture_region(x1, y1, x2, y2, path)
-        except Exception as exc:
+        except Exception as exc:                      # noqa: BLE001
             self.var_status.set("截图失败")
             self._log(f"✗ 截图失败：{exc}")
             messagebox.showerror("截图失败", str(exc))
             return
 
-        # 3) 成功反馈
+        # 4) 成功反馈（先推进自动名，免得连点两次覆盖上一张）
+        self._advance_auto_name()
         region = transform_pos(x1, y1, x2, y2)
         self.var_status.set(f"完成　{region['width']}×{region['height']} px")
         self._log(f"✓ 已保存：{saved}")
 
     # ---------- 屏幕拖拽拾取区域 ----------
     def _pick_region(self):
-        """ 进入“拾取区域”模式。
+        """「拾取区域」按钮：先把自己藏起来，再铺遮罩让用户拖框。
 
-            先隐藏主窗口，延迟 200ms 再创建全屏遮罩：
-
-            - withdraw() 是异步的，窗口真正从屏幕消失需要一点时间；
-            - 若立刻创建遮罩，可能把还没消失的主窗口一起截进去；
-            - after 不阻塞主线程，200ms 内事件循环正常处理窗口隐藏。
+        延迟 200ms 是为了等窗口真的从屏幕上消失 ——
+        不等的话，遮罩背景里会残留自己的窗口。
         """
         self.root.withdraw()
         self.root.after(200, self._create_overlay)
 
-
     def _create_overlay(self):
-        sw=self.root.winfo_screenwidth()
-        sh=self.root.winfo_screenheight()
+        """铺一层半透明全屏遮罩，让用户拖出一个矩形。
 
-        ov=tk.Toplevel(self.root)
-        ov.overrideredirect(True)#去掉标题栏和边框
-        ov.geometry(f"{sw}x{sh}+0+0")#铺满屏幕
-        ov.attributes("-topmost", True)# 置顶
+        拖完把结果写回四个坐标框（自动取左上/右下，往哪个方向拖都对）；
+        按 Esc、或拖得比 2px 还小，都算取消，什么都不改。
+        """
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+
+        ov = tk.Toplevel(self.root)
+        ov.overrideredirect(True)
+        ov.geometry(f"{sw}x{sh}+0+0")
+        ov.attributes("-topmost", True)
         try:
-            ov.attributes("-alpha",0.30)#不透明度30%
+            ov.attributes("-alpha", 0.30)
         except tk.TclError:
             pass
-        ov.configure(bg="black")#黑色蒙版
+        ov.configure(bg="black")
 
         canvas = tk.Canvas(ov, bg="black", highlightthickness=0, cursor="crosshair")
         canvas.pack(fill="both", expand=True)
 
+        # 一次拖拽的全部状态：起点 (sx, sy)、画布上的矩形 id、是否已经收尾
         state = {"sx": 0, "sy": 0, "rect": None, "done": False}
 
-        def to_canvas(xr,yr):
-            """
-                把屏幕坐标 (xr, yr) 转成 canvas 内部坐标。
+        def to_canvas(xr, yr):
+            """屏幕绝对坐标 → 画布内坐标。
 
-                - canvas 有自己的坐标系，原点在画布左上角；
-                - winfo_rootx/y 给出画布左上角在屏幕上的位置，
-                两者相减即得画布内部坐标。
-
-                :param xr: 屏幕坐标的 x（相对屏幕左上角）
-                :param yr: 屏幕坐标的 y（相对屏幕左上角）
-                :return: canvas 内部坐标 (x, y)
+            画布铺满整屏时两者通常相等，但多显示器 / 窗口有偏移时会有差别，
+            所以老老实实换算一次。
             """
-            return xr-canvas.winfo_rootx(), yr-canvas.winfo_rooty()
+            return xr - canvas.winfo_rootx(), yr - canvas.winfo_rooty()
 
         def on_press(e):
-            """鼠标按下：记录起点，并在画布上创建 0 大小的初始矩形。
-
-            - 起点用 e.x_root/e.y_root（屏幕坐标），供最终算区域用；
-            - 画图需画布坐标，故用 to_canvas 转换；
-            - 矩形初始四角重合，拖动时由 on_drag 更新右下角。
-            """
-            state["sx"], state["sy"] = e.x_root, e.y_root  # 起点（屏幕坐标）
-            cx, cy = to_canvas(e.x_root, e.y_root)  # 转画布坐标
+            """按下鼠标：记下起点，并在光标处画出一个零尺寸的矩形。"""
+            state["sx"], state["sy"] = e.x_root, e.y_root
+            cx, cy = to_canvas(e.x_root, e.y_root)
             state["rect"] = canvas.create_rectangle(
-                cx, cy, cx, cy, outline="#ff3b30", width=2  # 0 大小，待拖动放大
+                cx, cy, cx, cy, outline="#ff3b30", width=2
             )
 
-        def on_drag(e: tk.Event):
-            """鼠标拖动回调：把选框矩形更新为“起点 → 当前鼠标位置”。
-
-            左上角固定在按下时的起点 (sx, sy)，右下角跟随鼠标实时移动，
-            从而拖出可缩放的选择框。
-
-            :param e: 鼠标拖动事件，提供 e.x_root / e.y_root（屏幕坐标）
-            """
+        def on_drag(e):
+            """拖动中：让矩形的一个角跟着光标跑。"""
             if state["rect"] is None:
                 return
             cx, cy = to_canvas(state["sx"], state["sy"])
             ex, ey = to_canvas(e.x_root, e.y_root)
-            canvas.coords(state["rect"], cx, cy, ex, ey)#更新矩形
+            canvas.coords(state["rect"], cx, cy, ex, ey)
 
-        def on_release(e: tk.Event):
-            """鼠标松开回调：校验选区、写回坐标并关闭遮罩。"""
+        def on_release(e):
+            """松开鼠标：收掉遮罩，把拖出的矩形写回四个坐标框。"""
             if state["done"]:
                 return
             state["done"] = True
 
             x1, y1 = state["sx"], state["sy"]
             x2, y2 = e.x_root, e.y_root
-
-            # 拖动范围过小 → 视为取消
-            if abs(x2 - x1) < 2 or abs(y2 - y1) < 2:
-                self._log("已取消区域拾取（拖动范围过小）。")
-                close()
-                return
-
-            # 规范化坐标（支持任意方向拖拽）
-            nx1, nx2 = min(x1, x2), max(x1, x2)
-            ny1, ny2 = min(y1, y2), max(y1, y2)
-
-            # 写回四个变量
-            self.var_x1.set(str(nx1))
-            self.var_y1.set(str(ny1))
-            self.var_x2.set(str(nx2))
-            self.var_y2.set(str(ny2))
-
-            # 日志用规范化后的坐标，和实际区域一致
-            self._log(f"已拾取区域：({nx1}, {ny1}) → ({nx2}, {ny2})")
-
-            # 最后再关遮罩、恢复主窗口
             close()
 
-        def close():
-            """结束区域拾取：释放 grab、销毁遮罩、恢复并置顶主窗口。
+            if abs(x2 - x1) < 2 or abs(y2 - y1) < 2:
+                self._log("已取消区域拾取（拖动范围过小）。")
+                return
 
-            无论用户是正常选完区域，还是按 Esc / 拖动过小取消，最终都会调用它。
-            收尾后主窗口重新显示、位于最前，并拿回键盘焦点。
-            """
-            # 若遮罩曾 grab_set 独占输入，这里必须释放；
-            # 未设置过或已释放时会抛 TclError，忽略即可
+            # 反着拖（从右下往左上）也要得到同一个矩形，所以统一取 min/max
+            self.var_x1.set(str(min(x1, x2)))
+            self.var_y1.set(str(min(y1, y2)))
+            self.var_x2.set(str(max(x1, x2)))
+            self.var_y2.set(str(max(y1, y2)))
+            self._log(f"已拾取区域：({x1}, {y1}) → ({x2}, {y2})")
+
+        def close():
+            """收掉遮罩、把主窗口放回来（正常拖完和按 Esc 都走这里）。"""
             try:
-                ov.grab_release()
+                ov.grab_release()     # 没抓过 grab 时释放会报错，忽略即可
             except tk.TclError:
                 pass
+            ov.destroy()
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
 
-            ov.destroy()  # 销毁遮罩，屏幕上的半透明层消失
-            self.root.deiconify()  # 恢复此前 withdraw() 隐藏的主窗口
-            self.root.lift()  # 提到同层窗口最前，避免被其他程序压住
-            self.root.focus_force()  # 强制拿回键盘焦点，恢复后可直接操作
-
-        # ---- 鼠标事件：按下 → 拖动 → 松开 ----
-        canvas.bind("<ButtonPress-1>", on_press)  # 左键按下：记起点、创建初始矩形
-        canvas.bind("<B1-Motion>", on_drag)  # 按住左键拖动：实时更新矩形四角
-        canvas.bind("<ButtonRelease-1>", on_release)  # 左键松开：算区域、写回坐标、收尾
-
-        # ---- 键盘取消：按 Esc 直接结束拾取 ----
-        # lambda 用来丢弃事件参数 e，close() 本身不需要它
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
         ov.bind("<Escape>", lambda e: close())
 
-        # ---- 抢焦点：确保键盘事件（Esc）能被接收到 ----
-        # overrideredirect(True) 的无边框窗口默认拿不到焦点，
-        # 单靠 focus_set 常不生效，故再用 focus_force 强制抢一次
-        canvas.focus_set()  # 请求把焦点给 canvas
-        ov.focus_force()  # 强制窗口拿到键盘焦点
+        canvas.focus_set()
+        ov.focus_force()
+
 
 def main():
+    """程序入口：建根窗口 → 套用 Windows 主题 → 进事件循环。"""
     root = tk.Tk()
     try:
-        ttk.Style().theme_use("vista")
+        ttk.Style().theme_use("vista")      # Windows 下更美观；其他平台自动回退
     except tk.TclError:
         pass
     ScreenshotApp(root)

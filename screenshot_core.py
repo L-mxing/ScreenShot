@@ -56,11 +56,11 @@ def capture_region(x1, y1, x2, y2, output_path):
 
 # ============================================================ 二、文件名与路径规则
 def generate_default_filename(now=None):
-    """默认截图文件名，格式为 Clipboard_Screenshot.png。
+    """默认截图文件名，格式为 screenshot.png。
 
-    这里保持固定命名，后续重复截图由 dedupe_path() 负责自动加 _2 / _3 等后缀。
+    这里保持固定命名，后续重复截图由 dedupe_path() 负责自动加 _1 / _2 等后缀。
     """
-    return "Clipboard_Screenshot.png"
+    return "screenshot.png"
 
 
 def dedupe_path(path):
