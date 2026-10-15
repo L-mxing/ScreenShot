@@ -45,67 +45,67 @@ class ScreenshotApp:
     # ================= 界面构建 =================
     def _build_ui(self):
         pad = dict(padx=6, pady=4)
-        main = ttk.Frame(self.root, padding=12)
-        main.grid(row=0, column=0, sticky="nsew")
+        main_w = ttk.Frame(self.root, padding=12)
+        main_w.grid(row=0, column=0)
 
         # ---------- 截图区域 ----------
-        area = ttk.LabelFrame(main, text="截图区域（屏幕坐标 / 像素）", padding=10)
+        area = ttk.LabelFrame(main_w, text="截图区域（屏幕坐标 / 像素）", padding=10)
         area.grid(row=0, column=0, sticky="ew")
 
         ttk.Label(area, text="左上角  X1").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(area, textvariable=self.var_x1, width=9).grid(row=0, column=1, **pad)
+        ttk.Entry(area, textvariable=self.var_x1, width=5).grid(row=0, column=1, **pad)
         ttk.Label(area, text="Y1").grid(row=0, column=2, sticky="e", **pad)
-        ttk.Entry(area, textvariable=self.var_y1, width=9).grid(row=0, column=3, **pad)
+        ttk.Entry(area, textvariable=self.var_y1, width=5).grid(row=0, column=3, **pad)
 
         ttk.Label(area, text="右下角  X2").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(area, textvariable=self.var_x2, width=9).grid(row=1, column=1, **pad)
+        ttk.Entry(area, textvariable=self.var_x2, width=5).grid(row=1, column=1, **pad)
         ttk.Label(area, text="Y2").grid(row=1, column=2, sticky="e", **pad)
-        ttk.Entry(area, textvariable=self.var_y2, width=9).grid(row=1, column=3, **pad)
+        ttk.Entry(area, textvariable=self.var_y2, width=5).grid(row=1, column=3, **pad)
 
         btns = ttk.Frame(area)
-        btns.grid(row=0, column=4, rowspan=2, padx=(12, 0))
-        ttk.Button(btns, text="拾取区域", command=self._pick_region, width=10).grid(
+        btns.grid(row=0, column=4, rowspan=2, padx=(6, 0))
+        ttk.Button(btns, text="拾取区域", command=self._pick_region, width=8).grid(
             row=0, column=0, pady=2
         )
-        ttk.Button(btns, text="全屏", command=self._fill_screen, width=10).grid(
+        ttk.Button(btns, text="全屏", command=self._fill_screen, width=8).grid(
             row=1, column=0, pady=2
         )
 
         ttk.Label(
             area, textvariable=self.var_size, foreground="#555555"
-        ).grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=5, sticky="w", padx=6,pady=(8, 0))
 
         # ---------- 保存路径 ----------
-        pathbox = ttk.LabelFrame(main, text="保存路径", padding=10)
+        pathbox = ttk.LabelFrame(main_w, text="保存路径", padding=10)
         pathbox.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        pathbox.columnconfigure(0, weight=1)
 
-        ttk.Entry(pathbox, textvariable=self.var_path).grid(
-            row=0, column=0, sticky="ew", padx=(0, 6)
+
+        ttk.Entry(pathbox, width=30,textvariable=self.var_path).grid(
+            row=0, column=0,  sticky="w",padx=(0, 6)
         )
         ttk.Button(pathbox, text="浏览…", command=self._browse, width=8).grid(
-            row=0, column=1
+            row=0, column=1,sticky="w",padx=4
         )
 
         # ---------- 操作按钮 ----------
-        actions = ttk.Frame(main)
+        actions = ttk.Frame(main_w)
         actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        actions.columnconfigure(0, weight=1)
 
-        ttk.Button(actions, text="截  图", command=self._on_capture).grid(
-            row=0, column=0, sticky="ew", ipady=4
+
+        ttk.Button(actions, text="截  图", command=self._on_capture,width=30).grid(
+            row=0, column=0, sticky="w",ipady=4,padx=(10,6)
         )
-        ttk.Button(actions, text="清空日志", command=self._clear_log).grid(
-            row=0, column=1, padx=(6, 0)
+        ttk.Button(actions, text="清空日志", command=self._clear_log,width=8).grid(
+            row=0, column=1,padx=3
         )
 
         # ---------- 日志 ----------
-        logbox = ttk.LabelFrame(main, text="日志", padding=6)
+        logbox = ttk.LabelFrame(main_w, text="日志", padding=6)
         logbox.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         logbox.columnconfigure(0, weight=1)
 
         self.txt_log = tk.Text(
-            logbox, height=7, width=54, state="disabled", wrap="word"
+            logbox, height=7, width=40, state="disabled", wrap="word"
         )
         self.txt_log.grid(row=0, column=0, sticky="nsew")
 
@@ -114,7 +114,7 @@ class ScreenshotApp:
         self.txt_log.configure(yscrollcommand=sb.set)
 
         ttk.Label(
-            main, textvariable=self.var_status, foreground="#0a7a4a"
+            main_w, textvariable=self.var_status, foreground="#0a7a4a"
         ).grid(row=4, column=0, sticky="w", pady=(8, 0))
 
     # ================= 内部工具 =================
@@ -154,7 +154,7 @@ class ScreenshotApp:
 
         region = transform_pos(x1, y1, x2, y2)
         self.var_size.set(
-            f"区域尺寸：{region['width']} × {region['height']} px"
+            f"区域尺寸：宽{region['width']} × 高{region['height']} px"
             f"　(left={region['left']}, top={region['top']})"
         )
 
